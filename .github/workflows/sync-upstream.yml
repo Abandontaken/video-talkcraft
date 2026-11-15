@@ -17,7 +17,7 @@ jobs:
       - name: Sync from upstream
         id: sync
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set +e
           gh repo sync "${{ github.repository }}" --branch "${{ github.event.repository.default_branch }}"
@@ -28,29 +28,6 @@ jobs:
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
             echo "sync_exit=$status" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Open or update conflict issue
-        if: steps.sync.outputs.ok != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          TITLE='Upstream sync needs manual merge'
-          BODY="Automatic daily sync from upstream failed because this fork has diverged or has merge conflicts.
-
-          This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's \"Sync fork\" UI, or a local merge), then resolve conflicts.
-
-          Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          Close this issue after you have merged."
-          existing="$(gh issue list --repo "${{ github.repository }}" --state open --json number,title --jq '.[] | select(.title=="Upstream sync needs manual merge") | .number' | head -n 1)"
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "${{ github.repository }}" --body "Another automatic sync attempt failed. Manual merge is still required.
-
-          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          else
-            gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body "$BODY"
           fi
 
       - name: Disable other Actions workflows
@@ -76,3 +53,77 @@ jobs:
                 gh api --method PUT "repos/${{ github.repository }}/actions/workflows/${id}/disable"
               fi
             done
+
+      - name: Cancel stray runs triggered by the sync merge
+        if: always() && steps.sync.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SELF_PATH='.github/workflows/sync-upstream.yml'
+          SELF_RUN_ID='${{ github.run_id }}'
+          now=$(date -u +%s)
+          for status in queued in_progress waiting requested pending; do
+            gh api "repos/${{ github.repository }}/actions/runs?status=${status}&per_page=100" \
+              --jq '.workflow_runs[] | [.id, .path, .status, .created_at, .html_url] | @tsv' \
+            | while IFS=$'\t' read -r id path run_status created_at url; do
+                [ -n "${id:-}" ] || continue
+                [ "$id" != "$SELF_RUN_ID" ] || continue
+                [ "$path" != "$SELF_PATH" ] || continue
+                created_epoch=$(date -u -d "$created_at" +%s)
+                age=$((now - created_epoch))
+                if [ "$age" -gt 900 ]; then
+                  echo "Skipping older run $id ($path, status=$run_status, age=${age}s)"
+                  continue
+                fi
+                echo "Cancelling $path run $id (status=$run_status, age=${age}s) $url"
+                gh api --method POST "repos/${{ github.repository }}/actions/runs/${id}/cancel" >/dev/null \
+                  || echo "Cancel failed for $id (may already be finishing)"
+              done
+          done
+
+      - name: Open or update conflict issue
+        if: always() && steps.sync.outputs.ok != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          TITLE='Upstream sync needs manual merge'
+          BODY="Automatic daily sync from upstream failed because this fork has diverged or has merge conflicts.
+
+          This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's \"Sync fork\" UI, or a local merge), then resolve conflicts.
+
+          Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Close this issue after you have merged."
+          if {
+            existing="$(gh issue list --repo "${{ github.repository }}" --state open --json number,title --jq '.[] | select(.title=="Upstream sync needs manual merge") | .number' | head -n 1)"
+            if [ -n "${existing:-}" ]; then
+              gh issue comment "$existing" --repo "${{ github.repository }}" --body "Another automatic sync attempt failed. Manual merge is still required.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            else
+              gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body "$BODY"
+            fi
+          }; then
+            echo "Conflict notice issue created or updated."
+          else
+            echo "Could not open or update a GitHub issue (issues may be disabled on this fork)."
+            {
+              echo "## Upstream sync needs manual merge"
+              echo
+              echo "Automatic daily sync from upstream failed because this fork has diverged or has merge conflicts."
+              echo
+              echo "This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's \"Sync fork\" UI, or a local merge), then resolve conflicts."
+              echo
+              echo "Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              echo
+              echo "A GitHub issue could not be created or updated — issues are probably disabled on this repository."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail job if sync failed
+        if: always() && steps.sync.outputs.ok != 'true'
+        run: |
+          echo "Upstream sync failed (exit ${{ steps.sync.outputs.sync_exit }}). This is a real sync failure, not a notice-step error."
+          exit 1
