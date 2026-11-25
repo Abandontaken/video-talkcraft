@@ -2,7 +2,7 @@ name: Sync upstream
 
 on:
   schedule:
-    - cron: '17 19 * * *'
+    - cron: "17 19 * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,103 +20,142 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           set +e
-          gh repo sync "${{ github.repository }}" --branch "${{ github.event.repository.default_branch }}"
+          sync_out="$(gh repo sync "${{ github.repository }}" --branch "${{ github.event.repository.default_branch }}" 2>&1)"
           status=$?
           set -e
-          if [ "$status" -eq 0 ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "sync_exit=$status" >> "$GITHUB_OUTPUT"
-          fi
+          printf '%s\n' "$sync_out"
+          {
+            echo "sync_exit=$status"
+            if [ "$status" -eq 0 ]; then
+              echo "ok=true"
+            else
+              echo "ok=false"
+            fi
+            echo "sync_out<<SYNC_OUT_EOF"
+            printf '%s\n' "$sync_out"
+            echo "SYNC_OUT_EOF"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Disable other Actions workflows
+      - name: Disable other Actions workflows and cancel stray runs
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_OK: ${{ steps.sync.outputs.ok }}
         run: |
           set -euo pipefail
-          SELF_PATH='.github/workflows/sync-upstream.yml'
-          gh api "repos/${{ github.repository }}/actions/workflows" --paginate \
-            --jq '.workflows[] | [.id, .path, .state] | @tsv' \
-          | while IFS=$'\t' read -r id path state; do
-              [ -n "${id:-}" ] || continue
-              if [ "$path" = "$SELF_PATH" ]; then
-                if [ "$state" != "active" ]; then
-                  echo "Enabling $path ($id)"
-                  gh api --method PUT "repos/${{ github.repository }}/actions/workflows/${id}/enable"
-                fi
-                continue
-              fi
-              if [ "$state" = "active" ]; then
-                echo "Disabling $path ($id, state=$state)"
-                gh api --method PUT "repos/${{ github.repository }}/actions/workflows/${id}/disable"
-              fi
-            done
+          SELF_PATH=".github/workflows/sync-upstream.yml"
+          SELF_RUN_ID="${{ github.run_id }}"
 
-      - name: Cancel stray runs triggered by the sync merge
-        if: always() && steps.sync.outputs.ok == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          SELF_PATH='.github/workflows/sync-upstream.yml'
-          SELF_RUN_ID='${{ github.run_id }}'
-          now=$(date -u +%s)
-          for status in queued in_progress waiting requested pending; do
-            gh api "repos/${{ github.repository }}/actions/runs?status=${status}&per_page=100" \
-              --jq '.workflow_runs[] | [.id, .path, .status, .created_at, .html_url] | @tsv' \
-            | while IFS=$'\t' read -r id path run_status created_at url; do
+          disable_others() {
+            gh api "repos/${{ github.repository }}/actions/workflows" --paginate \
+              --jq '.workflows[] | [.id, .path, .state] | @tsv' \
+            | while IFS=$'\t' read -r id path state; do
                 [ -n "${id:-}" ] || continue
-                [ "$id" != "$SELF_RUN_ID" ] || continue
-                [ "$path" != "$SELF_PATH" ] || continue
-                created_epoch=$(date -u -d "$created_at" +%s)
-                age=$((now - created_epoch))
-                if [ "$age" -gt 900 ]; then
-                  echo "Skipping older run $id ($path, status=$run_status, age=${age}s)"
+                if [ "$path" = "$SELF_PATH" ]; then
+                  if [ "$state" != "active" ]; then
+                    echo "Enabling $path ($id)"
+                    gh api --method PUT "repos/${{ github.repository }}/actions/workflows/${id}/enable"
+                  fi
                   continue
                 fi
-                echo "Cancelling $path run $id (status=$run_status, age=${age}s) $url"
-                gh api --method POST "repos/${{ github.repository }}/actions/runs/${id}/cancel" >/dev/null \
-                  || echo "Cancel failed for $id (may already be finishing)"
+                if [ "$state" = "active" ]; then
+                  echo "Disabling $path ($id, state=$state)"
+                  gh api --method PUT "repos/${{ github.repository }}/actions/workflows/${id}/disable"
+                fi
               done
-          done
+          }
+
+          cancel_strays() {
+            now=$(date -u +%s)
+            for status in queued in_progress waiting requested pending; do
+              gh api "repos/${{ github.repository }}/actions/runs?status=${status}&per_page=100" \
+                --jq '.workflow_runs[] | [.id, .path, .status, .created_at, .html_url] | @tsv' \
+              | while IFS=$'\t' read -r id path run_status created_at url; do
+                  [ -n "${id:-}" ] || continue
+                  [ "$id" != "$SELF_RUN_ID" ] || continue
+                  [ "$path" != "$SELF_PATH" ] || continue
+                  created_epoch=$(date -u -d "$created_at" +%s)
+                  age=$((now - created_epoch))
+                  if [ "$age" -gt 900 ]; then
+                    echo "Skipping older run $id ($path, status=$run_status, age=${age}s)"
+                    continue
+                  fi
+                  echo "Cancelling $path run $id (status=$run_status, age=${age}s) $url"
+                  gh api --method POST "repos/${{ github.repository }}/actions/runs/${id}/cancel" >/dev/null \
+                    || echo "Cancel failed for $id (may already be finishing)"
+                done
+            done
+          }
+
+          echo "Initial pass: disable any already-active workflows except Sync upstream."
+          disable_others
+
+          # After a successful sync, GitHub may re-enable workflows whose
+          # files changed in the merge, and enqueue those runs a few seconds later.
+          if [ "$SYNC_OK" = "true" ]; then
+            for i in 1 2 3; do
+              echo "Waiting 10s for GitHub to register post-sync workflow changes (pass $i/3)."
+              sleep 10
+              disable_others
+              cancel_strays
+            done
+          fi
 
       - name: Open or update conflict issue
         if: always() && steps.sync.outputs.ok != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_OUT: ${{ steps.sync.outputs.sync_out }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u
           TITLE='Upstream sync needs manual merge'
-          BODY="Automatic daily sync from upstream failed because this fork has diverged or has merge conflicts.
+          BODY="Automatic daily sync from upstream failed. This is often because the fork has diverged or has merge conflicts, or because the token cannot merge commits that change GitHub Actions workflow files.
 
-          This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's \"Sync fork\" UI, or a local merge), then resolve conflicts.
+          This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's \"Sync fork\" UI, or a local merge), then resolve conflicts. If the log says the workflow scope is required, add or update the FORK_SYNC_TOKEN repository secret (a token with the workflow scope).
 
-          Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Failed run: ${RUN_URL}
+
+          gh repo sync output:
+          ${SYNC_OUT}
 
           Close this issue after you have merged."
+
+          echo "=========================================="
+          echo "Upstream sync failed. This workflow never force-pushes."
+          echo "Failed run: ${RUN_URL}"
+          echo "gh repo sync output:"
+          printf '%s\n' "${SYNC_OUT:-}"
+          echo "=========================================="
+
           if {
             existing="$(gh issue list --repo "${{ github.repository }}" --state open --json number,title --jq '.[] | select(.title=="Upstream sync needs manual merge") | .number' | head -n 1)"
             if [ -n "${existing:-}" ]; then
               gh issue comment "$existing" --repo "${{ github.repository }}" --body "Another automatic sync attempt failed. Manual merge is still required.
 
-          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          Run: ${RUN_URL}
+
+          gh repo sync output:
+          ${SYNC_OUT}"
             else
               gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body "$BODY"
             fi
           }; then
             echo "Conflict notice issue created or updated."
           else
-            echo "Could not open or update a GitHub issue (issues may be disabled on this fork)."
+            echo "Could not open or update a GitHub issue (issues may be disabled on this fork). The failure details are in this run log and the job summary."
             {
               echo "## Upstream sync needs manual merge"
               echo
-              echo "Automatic daily sync from upstream failed because this fork has diverged or has merge conflicts."
+              echo "Automatic daily sync from upstream failed. This is often because the fork has diverged or has merge conflicts, or because the token cannot merge commits that change GitHub Actions workflow files."
               echo
-              echo "This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's \"Sync fork\" UI, or a local merge), then resolve conflicts."
+              echo "This workflow never force-pushes. Please merge upstream into the default branch manually (GitHub's \"Sync fork\" UI, or a local merge), then resolve conflicts. If the log says the workflow scope is required, add or update the FORK_SYNC_TOKEN repository secret (a token with the workflow scope)."
               echo
-              echo "Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              echo "Failed run: ${RUN_URL}"
+              echo
+              echo "gh repo sync output:"
+              echo
+              printf '%s\n' "${SYNC_OUT:-}"
               echo
               echo "A GitHub issue could not be created or updated — issues are probably disabled on this repository."
             } >> "$GITHUB_STEP_SUMMARY"
@@ -126,4 +165,5 @@ jobs:
         if: always() && steps.sync.outputs.ok != 'true'
         run: |
           echo "Upstream sync failed (exit ${{ steps.sync.outputs.sync_exit }}). This is a real sync failure, not a notice-step error."
+          echo "See the Sync from upstream step and the run log above for the gh repo sync output."
           exit 1
